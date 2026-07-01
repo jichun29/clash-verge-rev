@@ -1,51 +1,35 @@
-use super::CmdResult;
-use crate::{
-    core::{service, CoreManager},
-    utils::i18n::t,
-};
-use anyhow::Result;
+use super::{CmdResult, StringifyErr as _};
+use crate::core::service::{self, SERVICE_MANAGER, ServiceStatus};
 
-async fn execute_service_operation_sync<F, Fut, E>(service_op: F, op_type: &str) -> CmdResult
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<(), E>>,
-    E: ToString + std::fmt::Debug,
-{
-    if let Err(e) = service_op().await {
-        let emsg = format!("{} {} failed: {}", op_type, "Service", e.to_string());
-        return Err(t(emsg.as_str()).await);
-    }
-    if CoreManager::global().restart_core().await.is_err() {
-        let emsg = format!("{} {} failed", "Restart", "Core");
-        return Err(t(emsg.as_str()).await);
-    }
-    Ok(())
+async fn execute_service_operation_sync(status: ServiceStatus, op_type: &str) -> CmdResult {
+    SERVICE_MANAGER
+        .handle_service_status(status)
+        .await
+        .map_err(|e| format!("{op_type} Service failed: {e}").into())
 }
 
 #[tauri::command]
 pub async fn install_service() -> CmdResult {
-    execute_service_operation_sync(service::install_service, "Install").await
+    execute_service_operation_sync(ServiceStatus::InstallRequired, "Install").await
 }
 
 #[tauri::command]
 pub async fn uninstall_service() -> CmdResult {
-    execute_service_operation_sync(service::uninstall_service, "Uninstall").await
+    execute_service_operation_sync(ServiceStatus::UninstallRequired, "Uninstall").await
 }
 
 #[tauri::command]
 pub async fn reinstall_service() -> CmdResult {
-    execute_service_operation_sync(service::reinstall_service, "Reinstall").await
+    execute_service_operation_sync(ServiceStatus::ReinstallRequired, "Reinstall").await
 }
 
 #[tauri::command]
 pub async fn repair_service() -> CmdResult {
-    execute_service_operation_sync(service::force_reinstall_service, "Repair").await
+    execute_service_operation_sync(ServiceStatus::ForceReinstallRequired, "Repair").await
 }
 
 #[tauri::command]
 pub async fn is_service_available() -> CmdResult<bool> {
-    service::is_service_available()
-        .await
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    service::is_service_available().await.stringify_err()?;
+    Ok(true)
 }

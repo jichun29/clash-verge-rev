@@ -1,47 +1,52 @@
 use super::CmdResult;
-use crate::{ipc::IpcManager, logging, state::proxy::ProxyRequestCache, utils::logging::Type};
-use std::time::Duration;
+use crate::core::tray::Tray;
+use crate::process::AsyncHandler;
+use clash_verge_logging::{Type, logging};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-const PROXIES_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const PROVIDERS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+static TRAY_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
+static TRAY_SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// 同步托盘和GUI的代理选择状态
 #[tauri::command]
-pub async fn get_proxies() -> CmdResult<serde_json::Value> {
-    let manager = IpcManager::global();
-    let cache = ProxyRequestCache::global();
-    let key = ProxyRequestCache::make_key("proxies", "default");
-    let value = cache
-        .get_or_fetch(key, PROXIES_REFRESH_INTERVAL, || async {
-            manager.get_proxies().await.unwrap_or_else(|e| {
-                logging!(error, Type::Cmd, "Failed to fetch proxies: {e}");
-                serde_json::Value::Object(serde_json::Map::new())
-            })
-        })
-        .await;
-    Ok((*value).clone())
+pub async fn sync_tray_proxy_selection() -> CmdResult<()> {
+    if TRAY_SYNC_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        AsyncHandler::spawn(move || async move {
+            run_tray_sync_loop().await;
+        });
+    } else {
+        TRAY_SYNC_PENDING.store(true, Ordering::Release);
+    }
+
+    Ok(())
 }
 
-/// 强制刷新代理缓存用于profile切换
-#[tauri::command]
-pub async fn force_refresh_proxies() -> CmdResult<serde_json::Value> {
-    let cache = ProxyRequestCache::global();
-    let key = ProxyRequestCache::make_key("proxies", "default");
-    cache.map.remove(&key);
-    get_proxies().await
-}
+async fn run_tray_sync_loop() {
+    loop {
+        match Tray::global().update_menu().await {
+            Ok(_) => {
+                logging!(info, Type::Cmd, "Tray proxy selection synced successfully");
+            }
+            Err(e) => {
+                logging!(error, Type::Cmd, "Failed to sync tray proxy selection: {e}");
+            }
+        }
 
-#[tauri::command]
-pub async fn get_providers_proxies() -> CmdResult<serde_json::Value> {
-    let manager = IpcManager::global();
-    let cache = ProxyRequestCache::global();
-    let key = ProxyRequestCache::make_key("providers", "default");
-    let value = cache
-        .get_or_fetch(key, PROVIDERS_REFRESH_INTERVAL, || async {
-            manager.get_providers_proxies().await.unwrap_or_else(|e| {
-                logging!(error, Type::Cmd, "Failed to fetch provider proxies: {e}");
-                serde_json::Value::Object(serde_json::Map::new())
-            })
-        })
-        .await;
-    Ok((*value).clone())
+        if !TRAY_SYNC_PENDING.swap(false, Ordering::AcqRel) {
+            TRAY_SYNC_RUNNING.store(false, Ordering::Release);
+
+            if TRAY_SYNC_PENDING.swap(false, Ordering::AcqRel)
+                && TRAY_SYNC_RUNNING
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                continue;
+            }
+
+            break;
+        }
+    }
 }
