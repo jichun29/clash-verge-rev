@@ -2,27 +2,41 @@ import {
   alpha,
   ListItem,
   ListItemButton,
-  ListItemText,
   ListItemIcon,
-} from "@mui/material";
-import { useMatch, useResolvedPath, useNavigate } from "react-router-dom";
-import { useVerge } from "@/hooks/use-verge";
+  ListItemText,
+} from '@mui/material'
+import type { ReactNode } from 'react'
+import { useMatch, useNavigate, useResolvedPath } from 'react-router'
+
+import type { SortableItemRenderProps } from '@/components/base/sortable-item'
+import { useVerge } from '@/hooks/use-verge'
+
 interface Props {
-  to: string;
-  children: string;
-  icon: React.ReactNode[];
+  to: string
+  children: string
+  icon: ReactNode[]
+  sortable?: SortableItemRenderProps
 }
 export const LayoutItem = (props: Props) => {
-  const { to, children, icon } = props;
-  const { verge } = useVerge();
-  const { menu_icon } = verge ?? {};
-  const resolved = useResolvedPath(to);
-  const match = useMatch({ path: resolved.pathname, end: true });
-  const navigate = useNavigate();
+  const { to, children, icon, sortable } = props
+  const { verge } = useVerge()
+  const { menu_icon } = verge ?? {}
+  const navCollapsed = verge?.collapse_navbar ?? false
+  const resolved = useResolvedPath(to)
+  const match = useMatch({ path: resolved.pathname, end: true })
+  const navigate = useNavigate()
+
+  const effectiveMenuIcon =
+    navCollapsed && menu_icon === 'disable' ? 'monochrome' : menu_icon
 
   return (
-    <ListItem sx={{ py: 0.5, maxWidth: 250, mx: "auto", padding: "4px 0px" }}>
+    <ListItem
+      ref={sortable?.ref}
+      style={sortable?.style}
+      sx={{ py: 0.5, maxWidth: 250, mx: 'auto', padding: '4px 0px' }}
+    >
       <ListItemButton
+        ref={sortable?.handleRef}
         selected={!!match}
         sx={[
           {
@@ -31,41 +45,51 @@ export const LayoutItem = (props: Props) => {
             paddingLeft: 1,
             paddingRight: 1,
             marginRight: 1.25,
-            "& .MuiListItemText-primary": {
-              color: "text.primary",
-              fontWeight: "700",
+            cursor: 'pointer',
+            '& .MuiListItemText-primary': {
+              color: 'text.primary',
+              fontWeight: '700',
             },
           },
           ({ palette: { mode, primary } }) => {
             const bgcolor =
-              mode === "light"
+              mode === 'light'
                 ? alpha(primary.main, 0.15)
-                : alpha(primary.main, 0.35);
-            const color = mode === "light" ? "#1f1f1f" : "#ffffff";
-
+                : alpha(primary.main, 0.35)
+            const color = mode === 'light' ? '#1f1f1f' : '#ffffff'
             return {
-              "&.Mui-selected": { bgcolor },
-              "&.Mui-selected:hover": { bgcolor },
-              "&.Mui-selected .MuiListItemText-primary": { color },
-            };
+              '&.Mui-selected': { bgcolor },
+              '&.Mui-selected:hover': { bgcolor },
+              '&.Mui-selected .MuiListItemText-primary': { color },
+            }
           },
         ]}
+        title={navCollapsed ? children : undefined}
+        aria-label={navCollapsed ? children : undefined}
         onClick={() => navigate(to)}
       >
-        {(menu_icon === "monochrome" || !menu_icon) && (
-          <ListItemIcon sx={{ color: "text.primary", marginLeft: "6px" }}>
+        {(effectiveMenuIcon === 'monochrome' || !effectiveMenuIcon) && (
+          <ListItemIcon
+            sx={{
+              color: 'text.primary',
+              marginLeft: '6px',
+              cursor: 'inherit',
+            }}
+          >
             {icon[0]}
           </ListItemIcon>
         )}
-        {menu_icon === "colorful" && <ListItemIcon>{icon[1]}</ListItemIcon>}
+        {effectiveMenuIcon === 'colorful' && (
+          <ListItemIcon sx={{ cursor: 'inherit' }}>{icon[1]}</ListItemIcon>
+        )}
         <ListItemText
           sx={{
-            textAlign: "center",
-            marginLeft: menu_icon === "disable" ? "" : "-35px",
+            textAlign: 'center',
+            marginLeft: effectiveMenuIcon === 'disable' ? '' : '-35px',
           }}
           primary={children}
         />
       </ListItemButton>
     </ListItem>
-  );
-};
+  )
+}

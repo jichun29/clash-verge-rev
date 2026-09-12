@@ -1,20 +1,34 @@
-use super::CmdResult;
-use crate::{config::*, feat, wrap_err};
+use super::{CmdResult, proxy_aware_error};
+use crate::{
+    cmd::StringifyErr as _,
+    config::IVerge,
+    core::notification::{self, FailedOperation},
+    feat,
+};
+use clash_verge_draft::SharedDraft;
 
 /// 获取Verge配置
 #[tauri::command]
-pub async fn get_verge_config() -> CmdResult<IVergeResponse> {
-    let verge = Config::verge().await;
-    let verge_data = {
-        let ref_data = verge.latest_ref();
-        ref_data.clone()
-    };
-    let verge_response = IVergeResponse::from(*verge_data);
-    Ok(verge_response)
+pub async fn get_verge_config() -> CmdResult<SharedDraft<IVerge>> {
+    feat::fetch_verge_config().await.stringify_err()
 }
 
 /// 修改Verge配置
 #[tauri::command]
 pub async fn patch_verge_config(payload: IVerge) -> CmdResult {
-    wrap_err!(feat::patch_verge(payload, false).await)
+    let operation = system_proxy_operation(&payload);
+    let result = match operation {
+        Some(operation) => notification::asking_for(operation, Box::pin(feat::patch_verge(&payload, false))).await,
+        None => feat::patch_verge(&payload, false).await,
+    };
+    result.map_err(|error| proxy_aware_error(&error).asking_for(operation))
+}
+
+/// Extract a system proxy operation from a Verge patch.
+const fn system_proxy_operation(payload: &IVerge) -> Option<FailedOperation> {
+    match payload.enable_system_proxy {
+        Some(true) => Some(FailedOperation::SystemProxyEnable),
+        Some(false) => Some(FailedOperation::SystemProxyDisable),
+        None => None,
+    }
 }

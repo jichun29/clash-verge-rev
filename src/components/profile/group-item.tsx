@@ -1,3 +1,4 @@
+import { DeleteForeverRounded, UndoRounded } from '@mui/icons-material'
 import {
   Box,
   IconButton,
@@ -5,115 +6,71 @@ import {
   ListItemText,
   alpha,
   styled,
-} from "@mui/material";
-import { DeleteForeverRounded, UndoRounded } from "@mui/icons-material";
-import { useSortable } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-import { downloadIconCache } from "@/services/cmds";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+} from '@mui/material'
+
+import { useIconCache } from '@/hooks/use-icon-cache'
 interface Props {
-  type: "prepend" | "original" | "delete" | "append";
-  group: IProxyGroupConfig;
-  onDelete: () => void;
+  type: 'prepend' | 'original' | 'delete' | 'append'
+  group: IProxyGroupConfig
+  onDelete: () => void
 }
 
 export const GroupItem = (props: Props) => {
-  let { type, group, onDelete } = props;
-  const sortable = type === "prepend" || type === "append";
+  const { type, group, onDelete } = props
+  const isSortable = type === 'prepend' || type === 'append'
 
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = sortable
-    ? useSortable({ id: group.name })
-    : {
-        attributes: {},
-        listeners: {},
-        setNodeRef: null,
-        transform: null,
-        transition: null,
-        isDragging: false,
-      };
-
-  const [iconCachePath, setIconCachePath] = useState("");
-
-  useEffect(() => {
-    initIconCachePath();
-  }, [group]);
-
-  async function initIconCachePath() {
-    if (group.icon && group.icon.trim().startsWith("http")) {
-      const fileName =
-        group.name.replaceAll(" ", "") + "-" + getFileName(group.icon);
-      const iconPath = await downloadIconCache(group.icon, fileName);
-      setIconCachePath(convertFileSrc(iconPath));
-    }
-  }
-
-  function getFileName(url: string) {
-    return url.substring(url.lastIndexOf("/") + 1);
-  }
+  const iconCachePath = useIconCache({
+    icon: group.icon,
+    cacheKey: group.name.replaceAll(' ', ''),
+  })
 
   return (
     <ListItem
       dense
       sx={({ palette }) => ({
-        position: "relative",
+        position: 'relative',
         background:
-          type === "original"
-            ? palette.mode === "dark"
+          type === 'original'
+            ? palette.mode === 'dark'
               ? alpha(palette.background.paper, 0.3)
               : alpha(palette.grey[400], 0.3)
-            : type === "delete"
+            : type === 'delete'
               ? alpha(palette.error.main, 0.3)
               : alpha(palette.success.main, 0.3),
-        height: "100%",
-        margin: "8px 0",
-        borderRadius: "8px",
-        transform: CSS.Transform.toString(transform),
-        transition,
-        zIndex: isDragging ? "calc(infinity)" : undefined,
+        height: '100%',
+        borderRadius: '8px',
       })}
     >
-      {group.icon && group.icon?.trim().startsWith("http") && (
+      {group?.icon?.trim().startsWith('http') && (
         <img
-          src={iconCachePath === "" ? group.icon : iconCachePath}
+          alt={group.name}
+          src={iconCachePath === '' ? group.icon : iconCachePath}
           width="32px"
-          style={{
-            marginRight: "12px",
-            borderRadius: "6px",
-          }}
+          style={{ marginRight: '12px', borderRadius: '6px' }}
         />
       )}
-      {group.icon && group.icon?.trim().startsWith("data") && (
+      {group?.icon?.trim().startsWith('data') && (
         <img
+          alt={group.name}
           src={group.icon}
           width="32px"
-          style={{
-            marginRight: "12px",
-            borderRadius: "6px",
-          }}
+          style={{ marginRight: '12px', borderRadius: '6px' }}
         />
       )}
-      {group.icon && group.icon?.trim().startsWith("<svg") && (
+      {group?.icon?.trim().startsWith('<svg') && (
         <img
-          src={`data:image/svg+xml;base64,${btoa(group.icon ?? "")}`}
+          alt={group.name}
+          src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(group.icon)}`}
           width="32px"
+          style={{ marginRight: '12px', borderRadius: '6px' }}
         />
       )}
       <ListItemText
-        {...attributes}
-        {...listeners}
-        ref={setNodeRef}
-        sx={{ cursor: sortable ? "move" : "" }}
+        data-sortable-handle
+        sx={{ cursor: isSortable ? 'move' : undefined }}
         primary={
           <StyledPrimary
-            sx={{ textDecoration: type === "delete" ? "line-through" : "" }}
+            sx={{ textDecoration: type === 'delete' ? 'line-through' : '' }}
           >
             {group.name}
           </StyledPrimary>
@@ -121,53 +78,55 @@ export const GroupItem = (props: Props) => {
         secondary={
           <ListItemTextChild
             sx={{
-              overflow: "hidden",
-              display: "flex",
-              alignItems: "center",
-              pt: "2px",
+              overflow: 'hidden',
+              display: 'flex',
+              alignItems: 'center',
+              pt: '2px',
             }}
           >
-            <Box sx={{ marginTop: "2px" }}>
+            <Box sx={{ marginTop: '2px' }}>
               <StyledTypeBox>{group.type}</StyledTypeBox>
             </Box>
           </ListItemTextChild>
         }
-        secondaryTypographyProps={{
-          sx: {
-            display: "flex",
-            alignItems: "center",
-            color: "#ccc",
+        slotProps={{
+          secondary: {
+            sx: {
+              display: 'flex',
+              alignItems: 'center',
+              color: '#ccc',
+            },
           },
         }}
       />
       <IconButton onClick={onDelete}>
-        {type === "delete" ? <UndoRounded /> : <DeleteForeverRounded />}
+        {type === 'delete' ? <UndoRounded /> : <DeleteForeverRounded />}
       </IconButton>
     </ListItem>
-  );
-};
+  )
+}
 
-const StyledPrimary = styled("div")`
+const StyledPrimary = styled('div')`
   font-size: 15px;
   font-weight: 700;
   line-height: 1.5;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-`;
+`
 
-const ListItemTextChild = styled("span")`
+const ListItemTextChild = styled('span')`
   display: block;
-`;
+`
 
 const StyledTypeBox = styled(ListItemTextChild)(({ theme }) => ({
-  display: "inline-block",
-  border: "1px solid #ccc",
+  display: 'inline-block',
+  border: '1px solid #ccc',
   borderColor: alpha(theme.palette.primary.main, 0.5),
   color: alpha(theme.palette.primary.main, 0.8),
   borderRadius: 4,
   fontSize: 10,
-  padding: "0 4px",
+  padding: '0 4px',
   lineHeight: 1.5,
-  marginRight: "8px",
-}));
+  marginRight: '8px',
+}))

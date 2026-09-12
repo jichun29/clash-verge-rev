@@ -1,45 +1,70 @@
-import useSWR from "swr";
-import { getRunningMode, isAdmin, isServiceAvailable } from "@/services/cmds";
+import {
+  getAppUptime,
+  getRuntimeState,
+  type RunState,
+  type RunningMode,
+} from '@/services/cmds'
+import { useQuery } from '@/services/query-client'
 
-/**
- * 自定义 hook 用于获取系统运行状态
- * 包括运行模式、管理员状态、系统服务是否可用
- */
+import { useVisibility } from './use-visibility'
+
+export const runStateQueryKey = ['getRuntimeState'] as const
+const appUptimeQueryKey = ['appUptime'] as const
+
+/** Fail closed until the first snapshot so TUN never flashes as available. */
+const unknownRunState: RunState = {
+  mode: 'NotRunning',
+  service: 'unknown',
+  serviceUnavailableReason: null,
+  pendingAction: null,
+  sidecarAllowed: false,
+  isAdmin: false,
+  opInFlight: false,
+  serviceUsable: false,
+  tunCapable: false,
+  serviceNeedsAttention: false,
+}
+
+/** Event-driven run state; Rust owns all derived availability decisions. */
 export function useSystemState() {
-  // 获取运行模式
-  const { data: runningMode = "Sidecar", mutate: mutateRunningMode } = useSWR(
-    "getRunningMode",
-    getRunningMode,
-    {
-      suspense: false,
-      revalidateOnFocus: false,
-    },
-  );
+  const pageVisible = useVisibility()
 
-  // 获取管理员状态
-  const { data: isAdminMode = false } = useSWR("isAdmin", isAdmin, {
-    suspense: false,
-    revalidateOnFocus: false,
-  });
-
-  // 获取系统服务状态
-  const isServiceMode = runningMode === "Service";
-  const { data: isServiceOk = false } = useSWR(
-    "isServiceAvailable",
-    isServiceAvailable,
-    {
-      suspense: false,
-      revalidateOnFocus: false,
-      isPaused: () => !isServiceMode, // 仅在 Service 模式下请求
-    },
-  );
+  const {
+    data: runState = unknownRunState,
+    refetch: mutateSystemState,
+    isLoading,
+  } = useQuery({
+    queryKey: runStateQueryKey,
+    queryFn: getRuntimeState,
+    // A safety net only; transitions normally arrive by event.
+    refetchInterval: pageVisible ? 30000 : false,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
+  })
 
   return {
-    runningMode,
-    isAdminMode,
-    isSidecarMode: runningMode === "Sidecar",
-    isServiceMode: runningMode === "Service",
-    isServiceOk,
-    mutateRunningMode,
-  };
+    runState,
+    runningMode: runState.mode as RunningMode,
+    isAdminMode: runState.isAdmin,
+    isSidecarMode: runState.mode === 'Sidecar',
+    isServiceMode: runState.mode === 'Service',
+    isTunModeAvailable: runState.tunCapable,
+    serviceNeedsAttention: runState.serviceNeedsAttention,
+    mutateSystemState,
+    isLoading,
+  }
+}
+
+export function useAppUptime() {
+  const { data: uptime = 0 } = useQuery({
+    queryKey: appUptimeQueryKey,
+    queryFn: getAppUptime,
+    staleTime: 5000,
+    refetchInterval: 3000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    retry: 1,
+  })
+
+  return uptime
 }

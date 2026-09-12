@@ -1,78 +1,119 @@
-import useSWR, { mutate } from "swr";
-import { useVerge } from "@/hooks/use-verge";
-import { getAutotemProxy } from "@/services/cmds";
-import { useAppData } from "@/providers/app-data-provider";
-import { closeAllConnections } from "@/services/cmds";
+import { useRef } from 'react'
+import { closeAllConnections } from 'tauri-plugin-mihomo-api'
 
-// 系统代理状态检测统一逻辑
+import { useDisplayedMixedPort } from '@/hooks/use-displayed-mixed-port'
+import { useVerge } from '@/hooks/use-verge'
+import { useSystemData } from '@/providers/app-data-context'
+import {
+  getAutotemProxy,
+  getEmbeddedServerPort,
+  patchVergeConfig,
+} from '@/services/cmds'
+import {
+  removeCacheData,
+  revalidateQueries,
+  useQuery,
+} from '@/services/query-client'
+
 export const useSystemProxyState = () => {
-  const { verge, mutateVerge, patchVerge } = useVerge();
-  const { sysproxy } = useAppData();
-  const { data: autoproxy } = useSWR("getAutotemProxy", getAutotemProxy, {
-    revalidateOnFocus: true,
-    revalidateOnReconnect: true,
-  });
+  const { verge, mutateVerge } = useVerge()
+  const { sysproxy } = useSystemData()
+  const displayedMixedPort = useDisplayedMixedPort()
+  const { data: autoproxy } = useQuery({
+    queryKey: ['getAutotemProxy'],
+    queryFn: getAutotemProxy,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
+  })
+  const { data: pacPort } = useQuery({
+    queryKey: ['getEmbeddedServerPort'],
+    queryFn: getEmbeddedServerPort,
+  })
 
-  const { enable_system_proxy, proxy_auto_config } = verge ?? {};
+  const { proxy_auto_config, proxy_host } = verge ?? {}
 
-  const getSystemProxyActualState = () => {
-    const userEnabled = enable_system_proxy ?? false;
-
-    // 用户配置状态应该与系统实际状态一致
-    // 如果用户启用了系统代理，检查实际的系统状态
-    if (userEnabled) {
-      if (proxy_auto_config) {
-        return autoproxy?.enable ?? false;
-      } else {
-        return sysproxy?.enable ?? false;
-      }
-    }
-
-    // 用户没有启用时，返回 false
-    return false;
-  };
-
-  const getSystemProxyIndicator = () => {
+  const indicator = (() => {
+    const host = proxy_host || '127.0.0.1'
     if (proxy_auto_config) {
-      return autoproxy?.enable ?? false;
+      if (!autoproxy?.enable) return false
+      if (!pacPort) return false
+      return autoproxy.url === `http://${host}:${pacPort}/commands/pac`
     } else {
-      return sysproxy?.enable ?? false;
+      if (!sysproxy?.enable) return false
+      return sysproxy.server === `${host}:${displayedMixedPort}`
     }
-  };
+  })()
 
-  const updateProxyStatus = async () => {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await mutate("getSystemProxy");
-    await mutate("getAutotemProxy");
-  };
+  // Coalesce rapid clicks so only the latest requested state is applied.
+  const pendingRef = useRef<boolean | null>(null)
+  const busyRef = useRef(false)
 
-  const toggleSystemProxy = (enabled: boolean) => {
-    mutateVerge({ ...verge, enable_system_proxy: enabled }, false);
+  const toggleSystemProxy = async (enabled: boolean) => {
+    // Roll failed optimistic writes back to the latest confirmed state.
+    let confirmed = verge?.enable_system_proxy ?? false
+    mutateVerge(
+      (prev) => (prev ? { ...prev, enable_system_proxy: enabled } : prev),
+      false,
+    )
+    pendingRef.current = enabled
 
-    setTimeout(async () => {
-      try {
-        if (!enabled && verge?.auto_close_connection) {
-          closeAllConnections();
+    if (busyRef.current) return
+    busyRef.current = true
+
+    try {
+      while (pendingRef.current !== null) {
+        const target = pendingRef.current
+        pendingRef.current = null
+        await patchVergeConfig({ enable_system_proxy: target })
+        confirmed = target
+        if (!target && verge?.auto_close_connection) {
+          await closeAllConnections().catch(() => {})
         }
-        await patchVerge({ enable_system_proxy: enabled });
-
-        updateProxyStatus();
-      } catch (error) {
-        console.warn("[useSystemProxyState] toggleSystemProxy failed:", error);
-        mutateVerge({ ...verge, enable_system_proxy: !enabled }, false);
       }
-    }, 0);
+    } catch (error) {
+      mutateVerge(
+        (prev) => (prev ? { ...prev, enable_system_proxy: confirmed } : prev),
+        false,
+      )
+      // Queued requests were based on a state that never landed.
+      pendingRef.current = null
+      throw error
+    } finally {
+      busyRef.current = false
+      // Refreshing cached state is not part of the toggle's result: a failed read must not
+      // turn a write that landed into a reported failure.
+      try {
+        await revalidateQueries([['getVergeConfig']])
+      } catch (error) {
+        console.warn(
+          '[system-proxy] rereading the config after a toggle failed:',
+          error,
+        )
+      }
+      // Kept separate so an unreadable config cannot discard OS state that did read.
+      try {
+        await revalidateQueries([['getSystemProxy'], ['getAutotemProxy']])
+      } catch (error) {
+        console.warn(
+          '[system-proxy] rereading the OS proxy after a toggle failed:',
+          error,
+        )
+        // The indicator reports observed OS state, so an unreadable one must read as inactive
+        // rather than stay live from a stale cache.
+        await Promise.all([
+          removeCacheData(['getSystemProxy']),
+          removeCacheData(['getAutotemProxy']),
+        ])
+      }
+    }
+  }
 
-    return Promise.resolve();
-  };
+  const invalidateProxyState = () =>
+    revalidateQueries([['getSystemProxy'], ['getAutotemProxy']])
 
   return {
-    actualState: getSystemProxyActualState(),
-    indicator: getSystemProxyIndicator(),
-    configState: enable_system_proxy ?? false,
-    sysproxy,
-    autoproxy,
-    proxy_auto_config,
+    indicator,
     toggleSystemProxy,
-  };
-};
+    invalidateProxyState,
+  }
+}

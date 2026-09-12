@@ -1,162 +1,225 @@
 use crate::{
     cmd,
-    config::{profiles::profiles_draft_update_item_safe, Config, PrfItem, PrfOption},
-    core::{handle, tray, CoreManager},
-    logging,
-    utils::logging::Type,
+    config::{Config, PrfItem, PrfOption, profiles::profiles_update_item_safe},
+    core::{CoreManager, handle, tray, validate::ValidationOutcome},
+    utils::help::{mask_err, mask_url},
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
+use clash_verge_logging::{Type, logging, logging_error};
+use smartstring::alias::String;
 
 /// Toggle proxy profile
 pub async fn toggle_proxy_profile(profile_index: String) {
-    match cmd::patch_profiles_config_by_profile_index(profile_index).await {
+    if let Err(err) = cmd::patch_profiles_config_by_profile_index(profile_index.clone()).await {
+        logging!(
+            error,
+            Type::Config,
+            "toggle proxy profile {profile_index} failed: {err}"
+        );
+    }
+}
+
+/// Tell the profile which node this group is on now.
+///
+/// The core is already switched by the time this runs, so failing to record is not a reason to
+/// report the switch as failed — but it is worth a log line, because what the profile holds is
+/// what gets re-applied the next time a core starts.
+async fn record_switched_node(group_name: &str, proxy_name: &str) {
+    if let Err(error) = crate::config::profiles::record_selected_node(group_name, proxy_name).await {
+        logging!(
+            warn,
+            Type::Config,
+            "切换代理成功但未能记录到配置: {} -> {}, 错误: {error:#}",
+            group_name,
+            proxy_name
+        );
+    }
+}
+
+pub async fn switch_proxy_node(group_name: &str, proxy_name: &str) {
+    match handle::Handle::mihomo()
+        .select_node_for_group(group_name, proxy_name)
+        .await
+    {
         Ok(_) => {
-            let result = tray::Tray::global().update_menu().await;
-            if let Err(err) = result {
-                logging!(error, Type::Tray, true, "更新菜单失败: {}", err);
-            }
+            record_switched_node(group_name, proxy_name).await;
+            handle::Handle::refresh_proxy_config();
+            let _ = tray::Tray::global().update_menu().await;
+            return;
         }
         Err(err) => {
-            log::error!(target: "app", "{err}");
+            logging!(error, Type::Tray, "切换代理失败: {err:?}");
+        }
+    }
+
+    match handle::Handle::mihomo()
+        .select_node_for_group(group_name, proxy_name)
+        .await
+    {
+        Ok(_) => {
+            logging!(info, Type::Tray, "代理切换回退成功: {} -> {}", group_name, proxy_name);
+            record_switched_node(group_name, proxy_name).await;
+            let _ = tray::Tray::global().update_menu().await;
+        }
+        Err(err) => {
+            logging!(error, Type::Tray, "代理切换最终失败: {err:?}");
         }
     }
 }
 
-/// Update a profile
-/// If updating current profile, activate it
-/// auto_refresh: 是否自动更新配置和刷新前端
-pub async fn update_profile(
-    uid: String,
-    option: Option<PrfOption>,
-    auto_refresh: Option<bool>,
-) -> Result<()> {
-    logging!(info, Type::Config, true, "[订阅更新] 开始更新订阅 {}", uid);
-    let auto_refresh = auto_refresh.unwrap_or(true); // 默认为true，保持兼容性
+async fn should_update_profile(uid: &String, ignore_auto_update: bool) -> Result<Option<(String, Option<PrfOption>)>> {
+    let profiles = Config::profiles().await;
+    let profiles = profiles.latest_arc();
+    let item = profiles.get_item(uid)?;
+    let is_remote = item.itype.as_ref().is_some_and(|s| s == "remote");
 
-    let url_opt = {
-        let profiles = Config::profiles().await;
-        let profiles = profiles.latest_ref();
-        let item = profiles.get_item(&uid)?;
-        let is_remote = item.itype.as_ref().is_some_and(|s| s == "remote");
-
-        if !is_remote {
-            log::info!(target: "app", "[订阅更新] {uid} 不是远程订阅，跳过更新");
-            None // 非远程订阅直接更新
-        } else if item.url.is_none() {
-            log::warn!(target: "app", "[订阅更新] {uid} 缺少URL，无法更新");
-            bail!("failed to get the profile item url");
-        } else {
-            log::info!(target: "app",
-                "[订阅更新] {} 是远程订阅，URL: {}",
-                uid,
-                item.url.clone().ok_or_else(|| anyhow::anyhow!("Profile URL is None"))?
-            );
-            Some((
+    if !is_remote {
+        logging!(info, Type::Config, "[订阅更新] 不是远程订阅，跳过更新");
+        Ok(None)
+    } else if item.url.is_none() {
+        logging!(warn, Type::Config, "[订阅更新] 缺少URL，无法更新");
+        bail!("failed to get the profile item url");
+    } else if !ignore_auto_update && !item.option.as_ref().and_then(|o| o.allow_auto_update).unwrap_or(true) {
+        logging!(info, Type::Config, "[订阅更新] 禁止自动更新，跳过更新");
+        Ok(None)
+    } else {
+        logging!(
+            info,
+            Type::Config,
+            "[订阅更新] 远程订阅，URL: {}",
+            mask_url(
                 item.url
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Profile URL is None"))?,
-                item.option.clone(),
-            ))
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Profile URL is None"))?
+            )
+        );
+        Ok(Some((
+            item.url.clone().ok_or_else(|| anyhow::anyhow!("Profile URL is None"))?,
+            item.option.clone(),
+        )))
+    }
+}
+
+#[tracing::instrument(skip_all, level = "info", fields(uid = %uid, strategy = tracing::field::Empty))]
+async fn perform_profile_update(
+    uid: &String,
+    url: &String,
+    opt: Option<&PrfOption>,
+    option: Option<&PrfOption>,
+    is_mannual_trigger: bool,
+) -> Result<()> {
+    let mut merged_opt = PrfOption::merge(opt, option);
+    let profiles = Config::profiles().await;
+    let profiles_arc = profiles.latest_arc();
+    let profile_name = profiles_arc
+        .get_item(uid)
+        .ok()
+        .and_then(|item| item.name.clone())
+        .unwrap_or_else(|| String::from("UnKnown Profile"));
+
+    match PrfItem::from_url(url, None, None, merged_opt.as_ref()).await {
+        Ok(mut item) => {
+            logging!(info, Type::Config, "[订阅更新] 更新订阅配置成功");
+            profiles_update_item_safe(uid, &mut item).await?;
+            return Ok(());
+        }
+        Err(err) => {
+            logging!(
+                warn,
+                Type::Config,
+                "[订阅更新] 直接更新失败: {}，尝试使用Clash代理更新",
+                mask_err(&format!("{err:#}"))
+            );
+        }
+    }
+
+    merged_opt.get_or_insert_with(PrfOption::default).self_proxy = Some(true);
+    merged_opt.get_or_insert_with(PrfOption::default).with_proxy = Some(false);
+
+    match PrfItem::from_url(url, None, None, merged_opt.as_ref()).await {
+        Ok(mut item) => {
+            logging!(info, Type::Config, "[订阅更新] 使用 Clash代理 更新订阅配置成功");
+            profiles_update_item_safe(uid, &mut item).await?;
+            handle::Handle::notice_message("update_with_clash_proxy", profile_name);
+            return Ok(());
+        }
+        Err(err) => {
+            logging!(
+                warn,
+                Type::Config,
+                "[订阅更新] Clash代理更新失败: {}，尝试使用系统代理更新",
+                mask_err(&format!("{err:#}"))
+            );
+        }
+    }
+
+    merged_opt.get_or_insert_with(PrfOption::default).self_proxy = Some(false);
+    merged_opt.get_or_insert_with(PrfOption::default).with_proxy = Some(true);
+
+    let last_err = match PrfItem::from_url(url, None, None, merged_opt.as_ref()).await {
+        Ok(mut item) => {
+            logging!(info, Type::Config, "[订阅更新] 使用 系统代理 更新订阅配置成功");
+            profiles_update_item_safe(uid, &mut item).await?;
+            handle::Handle::notice_message("update_with_clash_proxy", profile_name);
+            return Ok(());
+        }
+        Err(err) => {
+            logging!(
+                warn,
+                Type::Config,
+                "[订阅更新] 系统代理更新失败: {}，所有重试均已失败",
+                mask_err(&format!("{err:#}"))
+            );
+            err
         }
     };
 
-    let should_update = match url_opt {
+    let last_err = mask_err(&last_err.to_string());
+    if is_mannual_trigger {
+        handle::Handle::notice_message("update_failed_even_with_clash", format!("{profile_name} - {last_err}"));
+    }
+    bail!(last_err)
+}
+
+#[tracing::instrument(skip_all, level = "info", fields(uid = %uid, manual = is_mannual_trigger))]
+pub async fn update_profile(uid: &String, option: Option<&PrfOption>, is_mannual_trigger: bool) -> Result<()> {
+    let url_opt = should_update_profile(uid, is_mannual_trigger).await?;
+
+    let profile_persisted = match url_opt {
         Some((url, opt)) => {
-            log::info!(target: "app", "[订阅更新] 开始下载新的订阅内容");
-            let merged_opt = PrfOption::merge(opt.clone(), option.clone());
-
-            // 尝试使用正常设置更新
-            match PrfItem::from_url(&url, None, None, merged_opt.clone()).await {
-                Ok(item) => {
-                    log::info!(target: "app", "[订阅更新] 更新订阅配置成功");
-                    let profiles = Config::profiles().await;
-
-                    // 使用Send-safe helper函数
-                    let result = profiles_draft_update_item_safe(uid.clone(), item).await;
-                    result?;
-
-                    let is_current = Some(uid.clone()) == profiles.latest_ref().get_current();
-                    log::info!(target: "app", "[订阅更新] 是否为当前使用的订阅: {is_current}");
-                    is_current && auto_refresh
-                }
-                Err(err) => {
-                    // 首次更新失败，尝试使用Clash代理
-                    log::warn!(target: "app", "[订阅更新] 正常更新失败: {err}，尝试使用Clash代理更新");
-
-                    // 发送通知
-                    handle::Handle::notice_message("update_retry_with_clash", uid.clone());
-
-                    // 保存原始代理设置
-                    let original_with_proxy = merged_opt.as_ref().and_then(|o| o.with_proxy);
-                    let original_self_proxy = merged_opt.as_ref().and_then(|o| o.self_proxy);
-
-                    // 创建使用Clash代理的选项
-                    let mut fallback_opt = merged_opt.unwrap_or_default();
-                    fallback_opt.with_proxy = Some(false);
-                    fallback_opt.self_proxy = Some(true);
-
-                    // 使用Clash代理重试
-                    match PrfItem::from_url(&url, None, None, Some(fallback_opt)).await {
-                        Ok(mut item) => {
-                            log::info!(target: "app", "[订阅更新] 使用Clash代理更新成功");
-
-                            // 恢复原始代理设置到item
-                            if let Some(option) = item.option.as_mut() {
-                                option.with_proxy = original_with_proxy;
-                                option.self_proxy = original_self_proxy;
-                            }
-
-                            // 更新到配置
-                            let profiles = Config::profiles().await;
-
-                            // 使用 Send-safe 方法进行数据操作
-                            profiles_draft_update_item_safe(uid.clone(), item.clone()).await?;
-
-                            // 获取配置名称用于通知
-                            let profile_name = item.name.clone().unwrap_or_else(|| uid.clone());
-
-                            // 发送通知告知用户自动更新使用了回退机制
-                            handle::Handle::notice_message("update_with_clash_proxy", profile_name);
-
-                            let is_current = Some(uid.clone()) == profiles.data_ref().get_current();
-                            log::info!(target: "app", "[订阅更新] 是否为当前使用的订阅: {is_current}");
-                            is_current && auto_refresh
-                        }
-                        Err(retry_err) => {
-                            log::error!(target: "app", "[订阅更新] 使用Clash代理更新仍然失败: {retry_err}");
-                            handle::Handle::notice_message(
-                                "update_failed_even_with_clash",
-                                format!("{retry_err}"),
-                            );
-                            return Err(retry_err);
-                        }
-                    }
-                }
-            }
+            perform_profile_update(uid, &url, opt.as_ref(), option, is_mannual_trigger).await?;
+            true
         }
-        None => auto_refresh,
+        None => false,
     };
+    let profiles = Config::profiles().await;
+    let is_current = profiles.latest_arc().current.as_ref() == Some(uid);
+    let should_refresh = is_current || (!profile_persisted && is_mannual_trigger);
 
-    if should_update {
-        logging!(info, Type::Config, true, "[订阅更新] 更新内核配置");
-        match CoreManager::global().update_config().await {
-            Ok(_) => {
-                logging!(info, Type::Config, true, "[订阅更新] 更新成功");
+    if should_refresh {
+        logging!(debug, Type::Config, "[订阅更新] 更新内核配置");
+        match CoreManager::global().update_config_with_force(is_mannual_trigger).await {
+            Ok(outcome) if outcome.is_valid() => {
+                logging_error!(Type::Config, Config::sync_dns_override().await);
                 handle::Handle::refresh_clash();
-                if let Err(err) = cmd::proxy::force_refresh_proxies().await {
-                    logging!(
-                        error,
-                        Type::Config,
-                        true,
-                        "[订阅更新] 代理组刷新失败: {}",
-                        err
-                    );
-                }
             }
-            Err(err) => {
-                logging!(error, Type::Config, true, "[订阅更新] 更新失败: {}", err);
-                handle::Handle::notice_message("update_failed", format!("{err}"));
-                log::error!(target: "app", "{err}");
+            Ok(outcome @ (ValidationOutcome::Skipped { .. } | ValidationOutcome::Busy)) if !is_mannual_trigger => {
+                logging!(info, Type::Config, "[订阅更新] 本次配置刷新已跳过: {}", outcome);
+            }
+            result => {
+                let message = match result {
+                    Ok(outcome) => outcome.to_string(),
+                    Err(err) => err.to_string(),
+                };
+                let message = mask_err(&message);
+                let message = if profile_persisted {
+                    format!("订阅已保存，但未能确认已应用到内核: {message}")
+                } else {
+                    message
+                };
+                logging!(error, Type::Config, "[订阅更新] 更新失败: {}", message);
+                handle::Handle::notice_message("update_failed", &message);
+                bail!(message);
             }
         }
     }
@@ -165,9 +228,10 @@ pub async fn update_profile(
 }
 
 /// 增强配置
-pub async fn enhance_profiles() -> Result<()> {
-    crate::core::CoreManager::global()
-        .update_config()
-        .await
-        .map(|_| ())
+pub async fn enhance_profiles() -> Result<ValidationOutcome> {
+    let outcome = CoreManager::global().update_config_forced().await?;
+    if outcome.is_valid() {
+        logging_error!(Type::Config, Config::sync_dns_override().await);
+    }
+    Ok(outcome)
 }

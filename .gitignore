@@ -10,3 +10,10 @@ scripts/_env.sh
 .tool-versions
 .idea
 .old
+.eslintcache
+.changelog_backups
+target
+.vfox.toml
+.vfox
+.claude
+.zed
